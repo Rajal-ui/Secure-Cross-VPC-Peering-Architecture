@@ -1,1 +1,9 @@
 docs
+
+__pycache__/
+*.py[cod]
+.env
+*.pem
+*.key
+*credentials*.csv
+*accessKeys*.csv

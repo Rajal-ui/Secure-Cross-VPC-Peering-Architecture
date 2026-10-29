@@ -84,6 +84,7 @@ Admin Workstation --(SSH:22)--> ewb-bastion (10.10.1.10) --(ProxyJump)--> ewb-ap
 | Programming Language | Python 3.9 | Application logic for generator and controller. |
 | Web Framework | Flask | Lightweight REST API to receive transaction payloads on App-B. |
 | HTTP Client | `requests` | Used by App-A to POST JSON to App-B over HTTP. |
+| Application Security | Optional `X-API-Key`, input validation, request size limits | Defense-in-depth beyond network isolation for the private HTTP endpoint. |
 | Networking Utilities | `ssh`, `scp`, `ping`, `curl`, `pkill`, `nohup` | Connectivity testing, secure transfer, and background execution. |
 | Package Management (Offline) | `pip`, `get-pip.py`, wheels (`*.whl`) | Installed packages on internet-isolated instances via bastion-mediated transfer. |
 
@@ -91,26 +92,48 @@ Admin Workstation --(SSH:22)--> ewb-bastion (10.10.1.10) --(ProxyJump)--> ewb-ap
 
 ### 7.1 App-A: Synthetic Data Generator (`generator.py`)
 
+**Source:** [`files/generator.py`](files/generator.py)
+
 **Location:** `ewb-app-a` (`10.10.2.10`) 
 
 **Functionality:**
 - Continuously generates synthetic financial transaction payloads in JSON format.
-- Fields generated: `transaction_id` (UUID), `amount` (random float), `currency` (USD/EUR/GBP/INR), `merchant` (random list), `timestamp` (UTC ISO format).
+- Fields generated: `transaction_id` (UUID), `amount` (random float from 5.00 to 5000.00), `currency` (`USD`), `merchant` (random list), `timestamp` (UTC ISO format).
 - Sends each payload via `POST` to `http://10.20.1.10:8080/reconcile` every 3 seconds using the `requests` library.
-- Logs request details with HTTP status code for visibility.
+- Uses a 5-second request timeout, a reusable `requests.Session`, and catches network errors so a failed POST does not stop the loop.
+- Reads `RECONCILE_URL`, `RECONCILE_API_KEY`, and `INTERVAL_SECONDS` from environment variables.
+- Logs the transaction ID, amount, and HTTP status code for visibility.
 
 ### 7.2 App-B: AI Finance Controller (`controller.py`)
+
+**Source:** [`files/controller.py`](files/controller.py)
 
 **Location:** `ewb-app-b` (`10.20.1.10`) 
 
 **Functionality:**
 - Runs a Flask application listening on `0.0.0.0:8080`.
-- Exposes REST endpoint: `POST /reconcile` to accept JSON transaction data.
+- Exposes REST endpoints: `POST /reconcile` to accept JSON transaction data and `GET /health` for liveness checks.
+- Validates `transaction_id`, `amount`, `currency`, `merchant`, and `timestamp` before processing.
 - **Mock Deterministic Matching Logic:**
   - If `amount > 1000` -> status = `LLM Review` (routes to simulated bounded LLM review path)
   - Else -> status = `Reconciled`
-- Prints/logs each transaction with merchant, currency, amount and final status to stdout (captured in `controller.log`).
-- Returns a JSON response with `transaction_id`, `status`, `amount`, `currency` and `processed_at`.
+- Prints/logs each transaction with its ID, amount, and final status to stdout (captured in `controller.log`).
+- Returns a JSON response with `transaction_id`, `amount`, `currency`, `merchant`, `timestamp`, `status`, and `reason`.
+- Rejects malformed JSON with `400`, unauthorized requests with `401` when a shared key is configured, and bodies larger than 16 KB with `413`.
+- Runs with Flask debug mode disabled.
+
+### 7.3 Security Hardening
+
+| Control | Implementation |
+| :-- | :-- |
+| Network isolation | VPC-B has no Internet Gateway, no public IP, and no NAT path. |
+| Least-privilege ingress | `ewb-sg-app-b` allows TCP 8080 only from `10.10.2.10/32`. |
+| Shared secret | Optional `X-API-Key` header checked against `RECONCILE_API_KEY` using a constant-time comparison. |
+| Input validation | Field type, length, and amount range checks reject malformed payloads before reconciliation. |
+| Request size limit | `MAX_CONTENT_LENGTH` defaults to 16 KB. |
+| Error handling | JSON `400` / `401` / `413` responses; no debug tracebacks are exposed. |
+| Request timeout | Generator uses a 5-second timeout and logs failures without exiting. |
+| Secrets hygiene | `.pem`, credential CSVs, `.env`, and the `docs/` directory are ignored by Git. |
 
 ## 8. End-to-End Workflow
 
@@ -122,7 +145,7 @@ Admin Workstation --(SSH:22)--> ewb-bastion (10.10.1.10) --(ProxyJump)--> ewb-ap
 | 4 | **Secure Access Setup** | Configure local `~/.ssh/config` with `ProxyJump` to access private instances via Bastion. |
 | 5 | **VPC Peering** | Create `ewb-a-b-peer`, accept the request, and update all three route tables to route inter-VPC traffic via `pcx-XXXX`. |
 | 6 | **Offline Package Preparation** | Use Bastion (internet access) to download `get-pip.py` (Python 3.9 compatible), `pip`, `flask`, `requests` and dependencies as wheels, transfer to App-A/App-B via SCP through Bastion. |
-| 7 | **Application Deployment** | Install packages offline on App-A/App-B, create `generator.py` and `controller.py`, run controller on App-B and generator on App-A in background with `nohup`. |
+| 7 | **Application Deployment** | Install packages offline on App-A/App-B, copy the tracked scripts from `files/` (`controller.py` to App-B, `generator.py` to App-A), and run them in the background with `nohup`. |
 | 8 | **Validation** | Test connectivity (`ping`), verify HTTP POSTs over peering, observe reconciliation logs. |
 
 ## 9. Working of the Project
@@ -131,22 +154,32 @@ Admin Workstation --(SSH:22)--> ewb-bastion (10.10.1.10) --(ProxyJump)--> ewb-ap
 2. **Data Flow:** For every 3 seconds, App-A constructs a random transaction and performs `requests.post("http://10.20.1.10:8080/reconcile", json=payload)`.
 3. **Routing:** Due to peering route on `ewb-rt-a-private`, packets are routed from `10.10.2.10` to `10.20.1.10` via the active VPC Peering connection.
 4. **Ingress Control:** `ewb-sg-app-b` validates source IP `10.10.2.10/32` and allows TCP traffic on port 8080.
-5. **Processing:** Flask on App-B parses the JSON, applies deterministic logic (`amount > 1000` -> `LLM Review`, else `Reconciled`), prints the outcome with timestamps, and responds with `HTTP 200 OK`.
-6. **Visibility:** App-A logs the POST attempt with returned HTTP status. App-B logs the full reconciliation decision with merchant, currency, amount and status.
+5. **Processing:** Flask on App-B validates the JSON, applies deterministic logic (`amount > 1000` -> `LLM Review`, else `Reconciled`), logs the outcome, and responds with `HTTP 200 OK`.
+6. **Visibility:** App-A logs the POST attempt with returned HTTP status. App-B logs the transaction ID, amount, and reconciliation decision.
 7. **Isolation:** App-B has no IGW, cannot reach the internet. All reconciliation happens strictly over the private peered network.
 
 ## 10. Application Usage
 
+### 10.0 Optional Shared Secret
+Generate a key once and export the same value on both instances:
+```bash
+export RECONCILE_API_KEY="$(openssl rand -hex 32)"
+```
+When set, the controller rejects requests without a matching `X-API-Key` header, and the generator sends it automatically.
+
 ### 10.1 Start Controller (App-B)
 ```bash
+export RECONCILE_API_KEY="<shared-key>"
 nohup python3 ~/controller.py > ~/controller.log 2>&1 &
 echo $! > ~/controller.pid
 ```
 ### 10.2 Start Generator (App-A)
 ```bash
+export RECONCILE_API_KEY="<shared-key>"
 nohup python3 ~/generator.py > ~/generator.log 2>&1 &
 echo $! > ~/generator.pid
 ```
+`RECONCILE_URL` overrides the generator target, `INTERVAL_SECONDS` overrides the 3-second cadence, and `PORT` overrides the controller port.
 ### 10.3 Monitor Live Output
 #### From local machine
 ```bash
@@ -164,18 +197,18 @@ During testing, the following was observed and validates correct working:
 
 From generator.log (App-A):
 ```bash
-[2026-10-24T14:44:30.046831+00:00] 64929ff8-... amount=257.91 -> HTTP 200
-[2026-10-24T14:44:33.055497+00:00] 66521c62-... amount=1960.48 -> HTTP 200
-[2026-10-24T14:44:36.062347+00:00] ec37eb9d-... amount=398.27 -> HTTP 200
+Sent 64929ff8-... amount=257.91 status=200
+Sent 66521c62-... amount=1960.48 status=200
+Sent ec37eb9d-... amount=398.27 status=200
 ```
 From controller.log (App-B):
 ```bash
-[2026-10-24T14:43:35.927533+00:00] cb2a7491-... | Spotify | INR | 2003.61 => LLM Review
+2026-10-24 14:43:35,927 INFO cb2a7491-... | amount=2003.61 | status=LLM Review | Amount exceeds the deterministic threshold of 1000.
 10.10.2.10 - - [24/Oct/2026 14:43:35] "POST /reconcile HTTP/1.1" 200 -
-[2026-10-24T14:44:05.993913+00:00] c0cc6221-... | Shell | INR | 979.68 => Reconciled
+2026-10-24 14:44:05,993 INFO c0cc6221-... | amount=979.68 | status=Reconciled | Amount is within the deterministic threshold.
 10.10.2.10 - - [24/Oct/2026 14:44:05] "POST /reconcile HTTP/1.1" 200 -
 ```
-> Inference: Transactions with amount > 1000 are correctly flagged as LLM Review. Transactions with amount <= 1000 are correctly marked as Reconciled. All requests return HTTP 200 over the private VPC peering connection.
+> Inference: Transactions with amount > 1000 are correctly flagged as LLM Review. Transactions with amount <= 1000 are correctly marked as Reconciled. Valid requests return HTTP 200 over the private VPC peering connection; unauthorized, invalid, and oversized requests return 401, 400, and 413 respectively.
 
 ## 12. Key Learnings
 - Network Segmentation: Achieved strict isolation by keeping VPC-B air-gapped with no IGW.
@@ -209,9 +242,12 @@ This project successfully implements a Secure Cross-VPC Peering Architecture dem
 Secure-Cross-VPC-Peering/
 ├── SECURE_CROSS_VPC_PEERING_ARCHITECTURE_DOCUMENTATION.md
 ├── architecture diag.png
-└── README.md
+├── README.md
+└── files/
+    ├── controller.py
+    └── generator.py
 ```
-(application scripts created on instances: generator.py, controller.py)
+The `files/` directory contains the tracked application scripts that are copied to `ewb-app-a` and `ewb-app-b` during deployment.
 ## Appendix B: Quick Verification Commands
 ### Network test 
 ```bash

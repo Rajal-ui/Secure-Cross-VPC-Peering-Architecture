@@ -57,15 +57,32 @@ All other inbound traffic is denied.
 - **Runtime:** Python 3.9, Flask, `requests`
 - **Networking:** VPC Peering, custom route tables, security groups, SSH `ProxyJump`
 - **Offline bootstrapping:** wheels transferred via Bastion for internet-isolated instances
+- **Security:** Network isolation, least-privilege security groups, optional shared-secret API key, strict input validation, request size limits
 
 ## Application Design
 
 | Component | File | Function |
 | :-- | :-- | :-- |
-| App-A | `generator.py` | Generates synthetic transactions (UUID, amount, currency, merchant, timestamp) and `POST`s them to `http://10.20.1.10:8080/reconcile` every 3 seconds |
-| App-B | `controller.py` | Flask `POST /reconcile` endpoint; responds `LLM Review` when `amount > 1000`, otherwise `Reconciled` |
+| App-A | [`files/generator.py`](files/generator.py) | Generates synthetic transactions (UUID, amount, currency, merchant, timestamp) and `POST`s them to `http://10.20.1.10:8080/reconcile` every 3 seconds |
+| App-B | [`files/controller.py`](files/controller.py) | Flask `POST /reconcile` endpoint; responds `LLM Review` when `amount > 1000`, otherwise `Reconciled` |
 
-These scripts are deployed directly onto the EC2 instances and are not stored in this repository.
+Both scripts are tracked in the [`files`](files) directory and are copied to their respective EC2 instances during deployment. The controller requires Flask; the generator requires `requests`.
+
+## Security Controls
+
+- VPC-B has no Internet Gateway, no public IP addresses, and no NAT path. It is reachable only over the VPC peering connection.
+- Security groups restrict ingress to the expected source `/32` addresses and ports; all other inbound traffic is denied.
+- The controller enforces a 16 KB request body limit (`MAX_REQUEST_BYTES`) and validates every field before processing.
+- Set a shared secret on both instances to require an `X-API-Key` header. Generate it once and use the same value on App-A and App-B:
+
+  ```bash
+  export RECONCILE_API_KEY="$(openssl rand -hex 32)"
+  ```
+
+  Without this variable, the endpoint relies on network isolation alone.
+- Flask debug mode is disabled, and unexpected input returns `400`, `401`, or `413` instead of a traceback.
+- Never commit `.pem`, credentials, or `.env` files. Keys, credential CSVs, and the `docs/` directory are ignored by Git.
+- The generator uses a 5-second request timeout and catches network errors so a failed POST does not terminate the process.
 
 ## Deployment
 
@@ -80,13 +97,20 @@ High-level flow:
 5. Configure `~/.ssh/config` with `ProxyJump` through the Bastion.
 6. Create and accept `ewb-a-b-peer`, then add peering routes to all three route tables.
 7. Bootstrap `pip`, Flask, and `requests` offline via wheels transferred through the Bastion.
-8. Deploy and run `controller.py` on App-B and `generator.py` on App-A.
+8. Copy `files/controller.py` to App-B and `files/generator.py` to App-A, then start both processes.
 
 ## Usage
+
+Generate a shared API key once and export the same value on both instances (optional, but recommended):
+
+```bash
+export RECONCILE_API_KEY="$(openssl rand -hex 32)"
+```
 
 Start the controller (App-B):
 
 ```bash
+export RECONCILE_API_KEY="<shared-key>"
 nohup python3 ~/controller.py > ~/controller.log 2>&1 &
 echo $! > ~/controller.pid
 ```
@@ -94,9 +118,12 @@ echo $! > ~/controller.pid
 Start the generator (App-A):
 
 ```bash
+export RECONCILE_API_KEY="<shared-key>"
 nohup python3 ~/generator.py > ~/generator.log 2>&1 &
 echo $! > ~/generator.pid
 ```
+
+`RECONCILE_URL` overrides the generator target, `INTERVAL_SECONDS` overrides the 3-second cadence, and `PORT` overrides the controller port.
 
 Monitor logs:
 
@@ -129,14 +156,14 @@ Expected logs:
 
 ```
 # generator.log (App-A)
-[2026-10-24T14:44:30.046831+00:00] 64929ff8-... amount=257.91 -> HTTP 200
+Sent 64929ff8-... amount=257.91 status=200
 
 # controller.log (App-B)
-[2026-10-24T14:43:35.927533+00:00] cb2a7491-... | Spotify | INR | 2003.61 => LLM Review
+2026-10-24 14:43:35,927 INFO cb2a7491-... | amount=2003.61 | status=LLM Review | Amount exceeds the deterministic threshold of 1000.
 10.10.2.10 - - [24/Oct/2026 14:43:35] "POST /reconcile HTTP/1.1" 200 -
 ```
 
-Transactions above 1000 are flagged `LLM Review`; all others are `Reconciled`. Every request returns HTTP 200 over the private peering link.
+Transactions above 1000 are flagged `LLM Review`; all others are `Reconciled`. Valid requests return HTTP 200 over the private peering link; unauthorized, invalid, and oversized requests return 401, 400, and 413 respectively.
 
 ## Screenshots
 
